@@ -460,4 +460,4 @@ def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
     client = RotatingCHClient(api_keys, rotate_every=599)
     rows = collect_companies(client, date_from, date_to, seen_companies, officer_cache)
 
-    save_json_file(SEEN_FILE, sorted(seen_companies
+    save_json_file(SEEN_FILE, sorted(seen_companies))
