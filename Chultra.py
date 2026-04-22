@@ -10,10 +10,11 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 
 BASE_URL = "https://api.company-information.service.gov.uk"
-AUTO_REFRESH_SECONDS = 3
-AUTO_RUN_EVERY_SECONDS = 60
+AUTO_REFRESH_SECONDS = 60          # UI refresh every 60s
+AUTO_RUN_EVERY_SECONDS = 60        # Pipeline run every 60s
 
 TARGET_POSTCODE_PREFIXES = {
     "OX1", "OX2", "OX3", "OX4", "OX11", "OX14",
@@ -39,18 +40,18 @@ HOLDINGS_SIC_CODES = {
 
 TARGET_SIC_CODES = TECH_SIC_CODES | HOLDINGS_SIC_CODES
 
-BUZZWORD_TERMS = [
-    "Bidco", "Holdco", "Topco", "Midco", "Labs", "UK", "EMEA",
-    "Europe", "Pty", "PLC", "Pvt", "BV", "B.V", "Capital",
-    "Investment", "Ventures"
-]
-
 TARGET_COUNTRIES = {
     "united states", "usa", "us",
     "germany", "france", "netherlands", "spain", "finland",
     "denmark", "norway", "sweden", "austria", "poland",
     "greece", "portugal", "italy", "belgium", "hong kong"
 }
+
+BUZZWORD_TERMS = [
+    "Bidco", "Holdco", "Topco", "Midco", "Labs", "UK", "EMEA",
+    "Europe", "Pty", "PLC", "Pvt", "BV", "B.V", "Capital",
+    "Investment", "Ventures"
+]
 
 SEEN_FILE = "seen_companies.json"
 OFFICER_CACHE_FILE = "officer_appointments_cache.json"
@@ -61,21 +62,6 @@ for code in TECH_SIC_CODES:
     SIC_GROUP_MAP[code] = "Tech"
 for code in HOLDINGS_SIC_CODES:
     SIC_GROUP_MAP[code] = "Holdings"
-
-
-def inject_auto_refresh(seconds: int):
-    components.html(
-        f"""
-        <html>
-            <head>
-                <meta http-equiv="refresh" content="{seconds}">
-            </head>
-            <body></body>
-        </html>
-        """,
-        height=0,
-        width=0,
-    )
 
 
 def parse_key_string(raw: str) -> List[str]:
@@ -474,8 +460,4 @@ def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
     client = RotatingCHClient(api_keys, rotate_every=599)
     rows = collect_companies(client, date_from, date_to, seen_companies, officer_cache)
 
-    save_json_file(SEEN_FILE, sorted(seen_companies))
-    save_json_file(OFFICER_CACHE_FILE, officer_cache)
-    write_results_csv(rows, RESULTS_FILE)
-
-    return rows
+    save_json_file(SEEN_FILE, sorted(seen_companies
