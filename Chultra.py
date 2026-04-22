@@ -9,12 +9,8 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
-from streamlit_autorefresh import st_autorefresh
 
 BASE_URL = "https://api.company-information.service.gov.uk"
-AUTO_REFRESH_SECONDS = 60          # UI refresh every 60s
-AUTO_RUN_EVERY_SECONDS = 60        # Pipeline run every 60s
 
 TARGET_POSTCODE_PREFIXES = {
     "OX1", "OX2", "OX3", "OX4", "OX11", "OX14",
@@ -47,14 +43,20 @@ TARGET_COUNTRIES = {
     "greece", "portugal", "italy", "belgium", "hong kong"
 }
 
-BUZZWORD_TERMS = [
+ALL_BUZZWORD_TERMS = [
     "Bidco", "Holdco", "Topco", "Midco", "Labs", "UK", "EMEA",
     "Europe", "Pty", "PLC", "Pvt", "BV", "B.V", "Capital",
     "Investment", "Ventures"
 ]
 
+FAST_BUZZWORD_TERMS = [
+    "Bidco", "Holdco", "Topco", "Midco", "Labs",
+    "Capital", "Investment", "Ventures"
+]
+
 SEEN_FILE = "seen_companies.json"
 OFFICER_CACHE_FILE = "officer_appointments_cache.json"
+OFFICERS_FILE = "company_officers_cache.json"
 RESULTS_FILE = "companies_house_results.csv"
 
 SIC_GROUP_MAP = {}
@@ -178,13 +180,17 @@ def postcode_prefix_matches(postcode: Optional[str]) -> bool:
     return any(postcode.startswith(prefix) for prefix in TARGET_POSTCODE_PREFIXES)
 
 
+def get_buzzword_terms(search_mode: str) -> List[str]:
+    return FAST_BUZZWORD_TERMS if search_mode == "Fast" else ALL_BUZZWORD_TERMS
+
+
 def sic_matches(company_sic_codes: List[str]) -> bool:
     return any(code in TARGET_SIC_CODES for code in (company_sic_codes or []))
 
 
 def name_has_buzzwords(company_name: str) -> bool:
     name = (company_name or "").lower()
-    return any(term.lower() in name for term in BUZZWORD_TERMS)
+    return any(term.lower() in name for term in ALL_BUZZWORD_TERMS)
 
 
 def get_sic_group(company_sic_codes: List[str], company_name: str) -> str:
@@ -198,9 +204,13 @@ def get_sic_group(company_sic_codes: List[str], company_name: str) -> str:
     return ", ".join(groups) if groups else "Other"
 
 
-def get_company_officers(client: RotatingCHClient, company_number: str) -> List[dict]:
+def get_company_officers(client: RotatingCHClient, company_number: str, officers_cache: dict) -> List[dict]:
+    if company_number in officers_cache:
+        return officers_cache[company_number]
     data = client.get(f"/company/{company_number}/officers")
-    return data.get("items", [])
+    items = data.get("items", [])
+    officers_cache[company_number] = items
+    return items
 
 
 def is_active_director(officer: dict) -> bool:
@@ -269,10 +279,12 @@ def search_sic_companies(client: RotatingCHClient, start_date: str, end_date: st
     )
 
 
-def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
+def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_date: str, search_mode: str) -> List[dict]:
     results = []
     seen_numbers = set()
-    for term in BUZZWORD_TERMS:
+    buzzword_terms = get_buzzword_terms(search_mode)
+
+    for term in buzzword_terms:
         items = advanced_search_companies(
             client,
             {
@@ -286,6 +298,7 @@ def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_dat
             if company_number and company_number not in seen_numbers:
                 seen_numbers.add(company_number)
                 results.append(item)
+
     return results
 
 
@@ -309,7 +322,9 @@ def collect_companies(
     date_from: str,
     date_to: str,
     seen_companies: set,
-    officer_cache: dict
+    officer_cache: dict,
+    officers_cache: dict,
+    search_mode: str
 ) -> List[dict]:
     all_rows = []
 
@@ -318,7 +333,7 @@ def collect_companies(
         chunk_to = chunk_end.strftime("%Y-%m-%d")
 
         sic_companies = search_sic_companies(client, chunk_from, chunk_to)
-        buzzword_companies = search_buzzword_companies(client, chunk_from, chunk_to)
+        buzzword_companies = search_buzzword_companies(client, chunk_from, chunk_to, search_mode)
 
         combined = {}
         for company in sic_companies + buzzword_companies:
@@ -339,7 +354,7 @@ def collect_companies(
             if not (sic_matches(sic_codes) or name_has_buzzwords(company_name)):
                 continue
 
-            officers = get_company_officers(client, company_number)
+            officers = get_company_officers(client, company_number, officers_cache)
             directors = [o for o in officers if is_active_director(o)]
 
             director_names = []
@@ -358,11 +373,12 @@ def collect_companies(
                 if nationality in TARGET_COUNTRIES or residence in TARGET_COUNTRIES:
                     has_target_country = True
 
-                officer_id = get_officer_id(d)
-                if officer_id:
-                    appt_count = get_officer_appointments_count(client, officer_id, officer_cache)
-                    if appt_count > 1:
-                        has_multi_appointment_director = True
+                if not has_multi_appointment_director:
+                    officer_id = get_officer_id(d)
+                    if officer_id:
+                        appt_count = get_officer_appointments_count(client, officer_id, officer_cache)
+                        if appt_count > 1:
+                            has_multi_appointment_director = True
 
             first_director_name = director_names[0] if director_names else ""
 
@@ -453,11 +469,128 @@ def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
     return display_df.rename(columns=rename_map)
 
 
-def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
+def run_pipeline(api_keys: List[str], date_from: str, date_to: str, search_mode: str):
     seen_companies = set(load_json_file(SEEN_FILE, []))
     officer_cache = load_json_file(OFFICER_CACHE_FILE, {})
+    officers_cache = load_json_file(OFFICERS_FILE, {})
 
     client = RotatingCHClient(api_keys, rotate_every=599)
-    rows = collect_companies(client, date_from, date_to, seen_companies, officer_cache)
+    rows = collect_companies(
+        client,
+        date_from,
+        date_to,
+        seen_companies,
+        officer_cache,
+        officers_cache,
+        search_mode
+    )
 
     save_json_file(SEEN_FILE, sorted(seen_companies))
+    save_json_file(OFFICER_CACHE_FILE, officer_cache)
+    save_json_file(OFFICERS_FILE, officers_cache)
+    write_results_csv(rows, RESULTS_FILE)
+
+    return rows
+
+
+st.set_page_config(page_title="Companies House Live Monitor", layout="wide")
+st.title("Companies House Live Monitor")
+st.caption("Manual refresh dashboard for filtered Companies House results.")
+
+if "last_run_time" not in st.session_state:
+    st.session_state.last_run_time = None
+
+if "last_new_rows" not in st.session_state:
+    st.session_state.last_new_rows = []
+
+if "last_status" not in st.session_state:
+    st.session_state.last_status = "Waiting to run."
+
+with st.sidebar:
+    st.header("Search settings")
+    default_date = datetime.today().strftime("%Y-%m-%d")
+    date_from = st.text_input("Incorporation start date", value=default_date)
+    date_to = st.text_input("Incorporation end date", value=default_date)
+    search_mode = st.radio(
+        "Buzzword search mode",
+        ["Fast", "Full"],
+        help="Fast searches only higher-signal buzzwords. Full searches all configured buzzwords."
+    )
+    run_now = st.button("Refresh results now", type="primary")
+    clear_data = st.button("Clear saved results")
+
+api_keys = get_api_keys_from_sources()
+
+if api_keys:
+    st.success(f"Loaded {len(api_keys)} API key(s) from Streamlit secrets/environment variables.")
+else:
+    st.error(
+        "No API keys found. Add COMPANIES_HOUSE_API_KEYS to Streamlit Community Cloud Secrets "
+        "or to a local .streamlit/secrets.toml file."
+    )
+
+st.info(
+    f"Current mode: {search_mode}. "
+    f"{'Faster, narrower buzzword coverage.' if search_mode == 'Fast' else 'Slower, broader buzzword coverage.'}"
+)
+
+if clear_data:
+    for path in [RESULTS_FILE, SEEN_FILE, OFFICER_CACHE_FILE, OFFICERS_FILE]:
+        if os.path.exists(path):
+            os.remove(path)
+    st.session_state.last_run_time = None
+    st.session_state.last_new_rows = []
+    st.session_state.last_status = "Saved results and caches cleared."
+    st.success("Saved results and caches cleared.")
+    st.rerun()
+
+try:
+    parse_date(date_from)
+    parse_date(date_to)
+except ValueError:
+    st.error("Invalid date format. Please use YYYY-MM-DD.")
+    st.stop()
+
+if run_now:
+    if not api_keys:
+        st.session_state.last_status = "Cannot run: no API keys found."
+        st.error("Please add at least one Companies House API key in Streamlit secrets before running the app.")
+    else:
+        try:
+            with st.spinner("Checking Companies House for new matches..."):
+                new_rows = run_pipeline(api_keys, date_from, date_to, search_mode)
+            st.session_state.last_new_rows = new_rows
+            st.session_state.last_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.session_state.last_status = f"Run completed at {st.session_state.last_run_time}"
+            st.success(st.session_state.last_status)
+        except Exception as e:
+            st.session_state.last_status = f"Error during run: {e}"
+            st.error(st.session_state.last_status)
+
+results_df = load_results_df()
+display_results_df = prepare_display_df(results_df)
+new_results_df = prepare_display_df(pd.DataFrame(st.session_state.last_new_rows)) if st.session_state.last_new_rows else pd.DataFrame()
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Total results", len(results_df))
+col2.metric("New in last run", len(st.session_state.last_new_rows))
+col3.metric("Seen companies", len(load_json_file(SEEN_FILE, [])))
+
+if st.session_state.last_run_time:
+    st.caption(f"Last successful refresh: {st.session_state.last_run_time}")
+else:
+    st.caption("No successful run yet in this session.")
+
+st.caption(st.session_state.last_status)
+
+st.subheader("New results from last run")
+if not new_results_df.empty:
+    st.dataframe(new_results_df, use_container_width=True)
+else:
+    st.info("No new results found yet.")
+
+st.subheader("All tracked results")
+if not display_results_df.empty:
+    st.dataframe(display_results_df, use_container_width=True)
+else:
+    st.info("No tracked results yet.")
