@@ -30,16 +30,13 @@ def today_uk_str() -> str:
 
 def get_api_keys() -> List[str]:
     keys: List[str] = []
-
     list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
     if list_style_keys:
         keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
-
     for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
         value = st.secrets.get(key_name, "")
         if value:
             keys.append(str(value).strip())
-
     deduped_keys = []
     seen = set()
     for key in keys:
@@ -82,6 +79,7 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
     start_index = 0
     page_size = 5000
     rows = []
+    pull_counter = 0
 
     while True:
         params = {
@@ -94,37 +92,31 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
         response = fetch_with_rotation(url, params, api_keys)
         payload = response.json()
         items = payload.get("items", []) or []
-
         for item in items:
             sic_codes = [str(code) for code in item.get("sic_codes", []) if code]
             sector = classify_sector(sic_codes)
             if not sector:
                 continue
-            rows.append(
-                {
-                    "company_number": item.get("company_number", ""),
-                    "company_name": item.get("company_name", ""),
-                    "date_of_creation": item.get("date_of_creation", run_date),
-                    "sic_codes": ", ".join(sic_codes),
-                    "sector": sector,
-                    "kind": item.get("kind", ""),
-                    "company_status": item.get("company_status", ""),
-                }
-            )
-
+            rows.append({
+                "company_number": item.get("company_number", ""),
+                "company_name": item.get("company_name", ""),
+                "date_of_creation": item.get("date_of_creation", run_date),
+                "sic_codes": ", ".join(sic_codes),
+                "sector": sector,
+                "kind": item.get("kind", ""),
+                "company_status": item.get("company_status", ""),
+                "pull_order": pull_counter,
+            })
+            pull_counter += 1
         if len(items) < page_size:
             break
         start_index += page_size
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status"])
+        return pd.DataFrame(columns=["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status", "pull_order"])
 
-    df = (
-        df.sort_values(["company_name", "company_number"])
-        .drop_duplicates(subset=["company_number"], keep="last")
-        .reset_index(drop=True)
-    )
+    df = df.sort_values("pull_order", ascending=False, kind="stable").drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
     return df
 
 
@@ -165,21 +157,17 @@ def render_table(df: pd.DataFrame, title: str) -> None:
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Shows companies incorporated today that match your Tech and Holdings SIC code lists.")
-
+    st.caption("Shows companies incorporated today that match your Tech and Holdings SIC code lists, with newest pulls shown first.")
     api_keys = get_api_keys()
     if not api_keys:
         st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
         st.stop()
-
     run_date = today_uk_str()
     snapshot_path, seen_path = get_store_paths(run_date)
-
     st.sidebar.header("Controls")
     st.sidebar.write(f"Run date: {run_date}")
     st.sidebar.write(f"API keys loaded: {len(api_keys)}")
     refresh = st.sidebar.button("Refresh now", type="primary")
-
     if refresh or not snapshot_path.exists():
         with st.spinner("Fetching today’s companies from Companies House..."):
             current_df = fetch_companies_incorporated_today(api_keys, run_date)
@@ -192,47 +180,39 @@ def main() -> None:
     else:
         current_df = load_csv_or_empty(snapshot_path)
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status"]))
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status", "pull_order"]))
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
-
     current_df = st.session_state.get("latest_df", pd.DataFrame())
     new_df = st.session_state.get("new_df", pd.DataFrame())
-
     c1, c2, c3 = st.columns(3)
     c1.metric("Total pulled today", int(len(current_df)))
     c2.metric("New on latest refresh", int(len(new_df)))
     c3.metric("Run date", run_date)
-
     st.write(f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
-
     render_table(new_df, "New companies found on the latest refresh")
     render_table(current_df, "All companies pulled so far today")
-
     if not current_df.empty:
         csv_bytes = current_df[["company_name", "sector"]].rename(columns={"company_name": "Company Name", "sector": "Sector"}).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="Download today’s results as CSV",
-            data=csv_bytes,
-            file_name=f"companies_incorporated_{run_date}.csv",
-            mime="text/csv",
-        )
-
+        st.download_button(label="Download today’s results as CSV", data=csv_bytes, file_name=f"companies_incorporated_{run_date}.csv", mime="text/csv")
     with st.expander("Suggested .streamlit/secrets.toml"):
-        st.code(
-            'COMPANIES_HOUSE_API_KEYS = [\n  "your-first-key",\n  "your-second-key",\n  "your-third-key"\n]\n\n# Optional legacy format\n# CH_API_KEY_1 = "your-first-key"\n# CH_API_KEY_2 = "your-second-key"\n# CH_API_KEY_3 = "your-third-key"',
-            language="toml",
-        )
+        st.code('COMPANIES_HOUSE_API_KEYS = [
+  "your-first-key",
+  "your-second-key",
+  "your-third-key"
+]
 
+# Optional legacy format
+# CH_API_KEY_1 = "your-first-key"
+# CH_API_KEY_2 = "your-second-key"
+# CH_API_KEY_3 = "your-third-key"', language="toml")
     with st.expander("Notes"):
-        st.markdown(
-            """
+        st.markdown("""
 - The app uses the Companies House advanced company search endpoint filtered by `incorporated_from`, `incorporated_to`, and your SIC code lists.
 - Holdings takes priority if a company matches both sector lists.
+- The results are kept in newest-pull-first order within each refresh.
 - The top table shows companies that were not present in the saved daily snapshot before the latest manual refresh.
 - Daily snapshots reset automatically because the file names are date-based.
-            """
-        )
-
+        """)
 
 if __name__ == "__main__":
     main()
