@@ -1,596 +1,229 @@
-import json
-import os
-import re
-import time
-from datetime import datetime, timedelta
+import base64
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import requests
 import streamlit as st
 
-BASE_URL = "https://api.company-information.service.gov.uk"
-
-TARGET_POSTCODE_PREFIXES = {
-    "OX1", "OX2", "OX3", "OX4", "OX11", "OX14",
-    "CB1", "CB2", "CB3", "CB4", "CB21", "CB22", "CB23", "CB24",
-    "M1", "M2", "M13", "M14", "M15", "M50",
-    "BT1", "BT2", "BT3", "BT4", "BT5", "BT7", "BT8", "BT9",
-    "EC1V", "EC1", "E1", "N1", "N7", "W12", "E20", "E14", "SE1",
-    "EH1", "EH2", "EH3", "EH8", "EH9", "EH12", "EH16",
-    "B1", "B2", "B3", "B4", "B5", "B7", "B12", "B15", "B19",
-    "BS1", "BS2", "BS3", "BS8", "BS9", "BS16", "BS34"
-}
+st.set_page_config(page_title="Companies Incorporated Today", layout="wide")
 
 TECH_SIC_CODES = {
-    "58210", "58290", "59111", "59113", "59120", "59140", "59133", "59200",
-    "60100", "60200", "61100", "61200", "61300", "61900", "62011", "62012",
-    "62020", "62030", "62090", "63110", "63120", "71121", "71122", "71200",
-    "72110", "72190", "72200", "82290"
+    "62012", "62020", "58290", "58210", "61100", "61200", "61300", "61900",
+    "62011", "62030", "62090", "63110", "63120", "71200", "72110", "72190",
+    "72200", "71129",
 }
 
 HOLDINGS_SIC_CODES = {
-    "64201", "64202", "64203", "64204", "64205", "64209", "66300"
+    "64201", "64202", "64203", "64204", "64205", "64209", "66300",
 }
 
-TARGET_SIC_CODES = TECH_SIC_CODES | HOLDINGS_SIC_CODES
-
-TARGET_COUNTRIES = {
-    "united states", "usa", "us",
-    "germany", "france", "netherlands", "spain", "finland",
-    "denmark", "norway", "sweden", "austria", "poland",
-    "greece", "portugal", "italy", "belgium", "hong kong"
-}
-
-ALL_BUZZWORD_TERMS = [
-    "Bidco", "Holdco", "Topco", "Midco", "Labs", "UK", "EMEA",
-    "Europe", "Pty", "PLC", "Pvt", "BV", "B.V", "Capital",
-    "Investment", "Ventures"
-]
-
-FAST_BUZZWORD_TERMS = [
-    "Bidco", "Holdco", "Topco", "Midco", "Labs",
-    "Capital", "Investment", "Ventures"
-]
-
-SEEN_FILE = "seen_companies.json"
-OFFICER_CACHE_FILE = "officer_appointments_cache.json"
-OFFICERS_FILE = "company_officers_cache.json"
-RESULTS_FILE = "companies_house_results.csv"
-
-SIC_GROUP_MAP = {}
-for code in TECH_SIC_CODES:
-    SIC_GROUP_MAP[code] = "Tech"
-for code in HOLDINGS_SIC_CODES:
-    SIC_GROUP_MAP[code] = "Holdings"
+TARGET_SIC_CODES = sorted(TECH_SIC_CODES | HOLDINGS_SIC_CODES)
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
 
-def parse_key_string(raw: str) -> List[str]:
-    return [x.strip() for x in raw.split(",") if x.strip()]
+def today_uk_str() -> str:
+    return datetime.now().astimezone().date().isoformat()
 
 
-def get_api_keys_from_sources() -> List[str]:
-    try:
-        if "COMPANIES_HOUSE_API_KEYS" in st.secrets:
-            raw = st.secrets["COMPANIES_HOUSE_API_KEYS"]
-            if isinstance(raw, str):
-                return parse_key_string(raw)
-            if isinstance(raw, list):
-                return [str(x).strip() for x in raw if str(x).strip()]
-    except Exception:
-        pass
-
-    env_value = os.getenv("COMPANIES_HOUSE_API_KEYS", "")
-    if env_value:
-        return parse_key_string(env_value)
-
-    return []
+def get_api_keys() -> List[str]:
+    keys = []
+    for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
+        value = st.secrets.get(key_name, "")
+        if value:
+            keys.append(value)
+    return keys
 
 
-class RotatingCHClient:
-    def __init__(self, api_keys: List[str], rotate_every: int = 599):
-        if not api_keys:
-            raise ValueError("At least one Companies House API key is required.")
-        self.api_keys = api_keys
-        self.rotate_every = rotate_every
-        self.key_index = 0
-        self.request_count_on_key = 0
-        self.session = requests.Session()
-
-    def _rotate_key_if_needed(self):
-        if self.request_count_on_key >= self.rotate_every:
-            self.key_index = (self.key_index + 1) % len(self.api_keys)
-            self.request_count_on_key = 0
-
-    def _auth(self) -> Tuple[str, str]:
-        return (self.api_keys[self.key_index], "")
-
-    def get(self, path: str, params: Optional[dict] = None) -> dict:
-        retries = 0
-        while retries < 5:
-            self._rotate_key_if_needed()
-            url = f"{BASE_URL}{path}"
-            resp = self.session.get(url, params=params, auth=self._auth(), timeout=30)
-            self.request_count_on_key += 1
-
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                return {}
-            if resp.status_code == 429:
-                self.key_index = (self.key_index + 1) % len(self.api_keys)
-                self.request_count_on_key = 0
-                retries += 1
-                time.sleep(2)
-                continue
-            if 500 <= resp.status_code < 600:
-                retries += 1
-                time.sleep(2)
-                continue
-
-            raise RuntimeError(f"Request failed: {resp.status_code} {resp.text[:500]}")
-
-        raise RuntimeError(f"Failed after retries for path {path}")
+def auth_header(api_key: str) -> Dict[str, str]:
+    token = base64.b64encode(f"{api_key}:".encode()).decode()
+    return {"Authorization": f"Basic {token}", "User-Agent": "streamlit-companies-house-today-app"}
 
 
-def load_json_file(path: str, default):
-    p = Path(path)
-    if not p.exists():
-        return default
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default
-
-
-def save_json_file(path: str, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def parse_date(s: str) -> datetime:
-    return datetime.strptime(s, "%Y-%m-%d")
-
-
-def daterange_chunks(start_date: datetime, end_date: datetime, chunk_days: int = 7):
-    current = start_date
-    while current <= end_date:
-        chunk_end = min(current + timedelta(days=chunk_days - 1), end_date)
-        yield current, chunk_end
-        current = chunk_end + timedelta(days=1)
-
-
-def normalize_country(value: Optional[str]) -> str:
-    return (value or "").strip().lower()
-
-
-def trim_postcode_area(postcode: Optional[str]) -> str:
-    if not postcode:
-        return ""
-    postcode = postcode.strip().upper()
-    return postcode[:-3].strip() if len(postcode) > 3 else postcode
-
-
-def postcode_prefix_matches(postcode: Optional[str]) -> bool:
-    if not postcode:
-        return False
-    postcode = postcode.strip().upper()
-    return any(postcode.startswith(prefix) for prefix in TARGET_POSTCODE_PREFIXES)
-
-
-def get_buzzword_terms(search_mode: str) -> List[str]:
-    return FAST_BUZZWORD_TERMS if search_mode == "Fast" else ALL_BUZZWORD_TERMS
-
-
-def sic_matches(company_sic_codes: List[str]) -> bool:
-    return any(code in TARGET_SIC_CODES for code in (company_sic_codes or []))
-
-
-def name_has_buzzwords(company_name: str) -> bool:
-    name = (company_name or "").lower()
-    return any(term.lower() in name for term in ALL_BUZZWORD_TERMS)
-
-
-def get_sic_group(company_sic_codes: List[str], company_name: str) -> str:
-    groups = []
-    for code in company_sic_codes or []:
-        group = SIC_GROUP_MAP.get(code)
-        if group and group not in groups:
-            groups.append(group)
-    if name_has_buzzwords(company_name) and "Buzzwords" not in groups:
-        groups.append("Buzzwords")
-    return ", ".join(groups) if groups else "Other"
-
-
-def get_company_officers(client: RotatingCHClient, company_number: str, officers_cache: dict) -> List[dict]:
-    if company_number in officers_cache:
-        return officers_cache[company_number]
-    data = client.get(f"/company/{company_number}/officers")
-    items = data.get("items", [])
-    officers_cache[company_number] = items
-    return items
-
-
-def is_active_director(officer: dict) -> bool:
-    role = (officer.get("officer_role") or "").lower()
-    resigned_on = officer.get("resigned_on")
-    name = officer.get("name")
-    return role == "director" and not resigned_on and bool(name)
-
-
-def get_officer_id(officer: dict) -> Optional[str]:
-    links = officer.get("links", {})
-    officer_link = links.get("officer", {})
-    appointments = officer_link.get("appointments")
-    if appointments and "/officers/" in appointments:
-        try:
-            return appointments.split("/officers/")[1].split("/appointments")[0]
-        except Exception:
-            return None
+def classify_sector(sic_codes: List[str]) -> str | None:
+    codes = {str(code) for code in (sic_codes or [])}
+    if codes & HOLDINGS_SIC_CODES:
+        return "Holdings"
+    if codes & TECH_SIC_CODES:
+        return "Tech"
     return None
 
 
-def get_officer_appointments_count(client: RotatingCHClient, officer_id: str, cache: dict) -> int:
-    if officer_id in cache:
-        return cache[officer_id]
-    data = client.get(f"/officers/{officer_id}/appointments")
-    total_results = data.get("total_results")
-    count = total_results if total_results is not None else len(data.get("items", []))
-    cache[officer_id] = count
-    return count
+def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+    last_response = None
+    for api_key in api_keys:
+        response = requests.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
+        if response.status_code == 429:
+            last_response = response
+            continue
+        if response.status_code == 401:
+            last_response = response
+            continue
+        response.raise_for_status()
+        return response
+    if last_response is not None:
+        last_response.raise_for_status()
+    raise RuntimeError("No valid Companies House API keys were available.")
 
 
-def advanced_search_companies(client: RotatingCHClient, params: dict) -> List[dict]:
-    results = []
+def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd.DataFrame:
+    url = "https://api.company-information.service.gov.uk/advanced-search/companies"
     start_index = 0
-    size = 5000
+    page_size = 5000
+    rows = []
 
     while True:
-        page_params = dict(params)
-        page_params["size"] = size
-        page_params["start_index"] = start_index
-        data = client.get("/advanced-search/companies", params=page_params)
-        items = data.get("items", [])
-        if not items:
-            break
+        params = {
+            "incorporated_from": run_date,
+            "incorporated_to": run_date,
+            "sic_codes": ",".join(TARGET_SIC_CODES),
+            "size": str(page_size),
+            "start_index": str(start_index),
+        }
+        response = fetch_with_rotation(url, params, api_keys)
+        payload = response.json()
+        items = payload.get("items", []) or []
 
-        results.extend(items)
-
-        if len(items) < size:
-            break
-
-        start_index += size
-        if start_index >= 10000:
-            break
-
-    return results
-
-
-def search_sic_companies(client: RotatingCHClient, start_date: str, end_date: str) -> List[dict]:
-    return advanced_search_companies(
-        client,
-        {
-            "incorporated_from": start_date,
-            "incorporated_to": end_date,
-            "sic_codes": ",".join(sorted(TARGET_SIC_CODES)),
-        },
-    )
-
-
-def search_buzzword_companies(client: RotatingCHClient, start_date: str, end_date: str, search_mode: str) -> List[dict]:
-    results = []
-    seen_numbers = set()
-    buzzword_terms = get_buzzword_terms(search_mode)
-
-    for term in buzzword_terms:
-        items = advanced_search_companies(
-            client,
-            {
-                "incorporated_from": start_date,
-                "incorporated_to": end_date,
-                "company_name_includes": term,
-            },
-        )
         for item in items:
-            company_number = item.get("company_number")
-            if company_number and company_number not in seen_numbers:
-                seen_numbers.add(company_number)
-                results.append(item)
-
-    return results
-
-
-def make_assumed_email(first_director_name: str, company_name: str) -> str:
-    if not first_director_name or not company_name:
-        return ""
-
-    first_name = first_director_name.strip().split()[0].lower()
-    company_clean = company_name.lower()
-    company_clean = re.sub(r"\blimited\b|\bltd\b|\bplc\b|\bllp\b", "", company_clean)
-    company_clean = re.sub(r"[^a-z0-9]", "", company_clean)
-
-    if not first_name or not company_clean:
-        return ""
-
-    return f"{first_name}@{company_clean}.com"
-
-
-def collect_companies(
-    client: RotatingCHClient,
-    date_from: str,
-    date_to: str,
-    seen_companies: set,
-    officer_cache: dict,
-    officers_cache: dict,
-    search_mode: str
-) -> List[dict]:
-    all_rows = []
-
-    for chunk_start, chunk_end in daterange_chunks(parse_date(date_from), parse_date(date_to), chunk_days=7):
-        chunk_from = chunk_start.strftime("%Y-%m-%d")
-        chunk_to = chunk_end.strftime("%Y-%m-%d")
-
-        sic_companies = search_sic_companies(client, chunk_from, chunk_to)
-        buzzword_companies = search_buzzword_companies(client, chunk_from, chunk_to, search_mode)
-
-        combined = {}
-        for company in sic_companies + buzzword_companies:
-            company_number = company.get("company_number")
-            if company_number:
-                combined[company_number] = company
-
-        for company in combined.values():
-            company_number = company.get("company_number")
-            company_name = company.get("company_name", "")
-            sic_codes = company.get("sic_codes", []) or []
-            ro_address = company.get("registered_office_address", {}) or {}
-            ro_postcode = ro_address.get("postal_code") or ro_address.get("postcode") or company.get("postcode")
-
-            if not company_number or company_number in seen_companies:
+            sic_codes = [str(code) for code in item.get("sic_codes", []) if code]
+            sector = classify_sector(sic_codes)
+            if not sector:
                 continue
+            rows.append(
+                {
+                    "company_number": item.get("company_number", ""),
+                    "company_name": item.get("company_name", ""),
+                    "date_of_creation": item.get("date_of_creation", run_date),
+                    "sic_codes": ", ".join(sic_codes),
+                    "sector": sector,
+                    "kind": item.get("kind", ""),
+                    "company_status": item.get("company_status", ""),
+                }
+            )
 
-            if not (sic_matches(sic_codes) or name_has_buzzwords(company_name)):
-                continue
+        if len(items) < page_size:
+            break
+        start_index += page_size
 
-            officers = get_company_officers(client, company_number, officers_cache)
-            directors = [o for o in officers if is_active_director(o)]
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status"])
 
-            director_names = []
-            director_postcodes = []
-            has_target_country = False
-            has_multi_appointment_director = False
-
-            for d in directors:
-                director_names.append(d.get("name", ""))
-                d_postcode = (d.get("address") or {}).get("postal_code", "")
-                director_postcodes.append(d_postcode)
-
-                nationality = normalize_country(d.get("nationality"))
-                residence = normalize_country(d.get("country_of_residence"))
-
-                if nationality in TARGET_COUNTRIES or residence in TARGET_COUNTRIES:
-                    has_target_country = True
-
-                if not has_multi_appointment_director:
-                    officer_id = get_officer_id(d)
-                    if officer_id:
-                        appt_count = get_officer_appointments_count(client, officer_id, officer_cache)
-                        if appt_count > 1:
-                            has_multi_appointment_director = True
-
-            first_director_name = director_names[0] if director_names else ""
-
-            row = {
-                "company_name": company_name,
-                "company_number": company_number,
-                "SIC Group": get_sic_group(sic_codes, company_name),
-                "Directors": len(directors),
-                "sic_codes": "; ".join(sic_codes),
-                "Postcode": trim_postcode_area(ro_postcode),
-                "In Target Postcode": postcode_prefix_matches(ro_postcode),
-                "international?": has_target_country,
-                "Serial Founder": has_multi_appointment_director,
-                "Assumed Email": make_assumed_email(first_director_name, company_name),
-            }
-
-            for i, name in enumerate(director_names, start=1):
-                row[f"director_{i}_name"] = name
-            for i, pc in enumerate(director_postcodes, start=1):
-                row[f"director_{i}_postcode"] = pc
-
-            all_rows.append(row)
-            seen_companies.add(company_number)
-
-    return all_rows
+    df = (
+        df.sort_values(["company_name", "company_number"])
+        .drop_duplicates(subset=["company_number"], keep="last")
+        .reset_index(drop=True)
+    )
+    return df
 
 
-def write_results_csv(rows: List[dict], filename: str):
-    if not rows:
-        return
-
-    new_df = pd.DataFrame(rows)
-
-    if os.path.exists(filename):
-        try:
-            existing_df = pd.read_csv(filename)
-        except Exception:
-            existing_df = pd.DataFrame()
-    else:
-        existing_df = pd.DataFrame()
-
-    combined = pd.concat([existing_df, new_df], ignore_index=True) if not existing_df.empty else new_df
-
-    if "company_number" in combined.columns:
-        combined = combined.drop_duplicates(subset=["company_number"], keep="last")
-    else:
-        combined = combined.drop_duplicates()
-
-    combined.to_csv(filename, index=False, encoding="utf-8-sig")
+def get_store_paths(run_date: str) -> Tuple[Path, Path]:
+    snapshot_path = DATA_DIR / f"companies_{run_date}.csv"
+    seen_path = DATA_DIR / f"seen_{run_date}.csv"
+    return snapshot_path, seen_path
 
 
-def load_results_df() -> pd.DataFrame:
-    if os.path.exists(RESULTS_FILE):
-        try:
-            return pd.read_csv(RESULTS_FILE)
-        except Exception:
-            return pd.DataFrame()
+def load_csv_or_empty(path: Path) -> pd.DataFrame:
+    if path.exists():
+        return pd.read_csv(path, dtype=str).fillna("")
     return pd.DataFrame()
 
 
-def prepare_display_df(df: pd.DataFrame) -> pd.DataFrame:
+def identify_new_rows(current_df: pd.DataFrame, seen_df: pd.DataFrame) -> pd.DataFrame:
+    if current_df.empty:
+        return current_df.copy()
+    if seen_df.empty or "company_number" not in seen_df.columns:
+        return current_df.copy()
+    unseen = current_df[~current_df["company_number"].isin(seen_df["company_number"].astype(str))].copy()
+    return unseen.reset_index(drop=True)
+
+
+def save_state(current_df: pd.DataFrame, snapshot_path: Path, seen_path: Path) -> None:
+    current_df.to_csv(snapshot_path, index=False)
+    current_df.to_csv(seen_path, index=False)
+
+
+def render_table(df: pd.DataFrame, title: str) -> None:
+    st.subheader(title)
     if df.empty:
-        return df
-
-    display_df = df.copy()
-    display_df = display_df.drop(columns=["company_number"], errors="ignore")
-
-    ordered_cols = [
-        "company_name",
-        "Assumed Email",
-        "SIC Group",
-        "Directors",
-        "sic_codes",
-        "Postcode",
-        "In Target Postcode",
-        "international?",
-        "Serial Founder",
-    ]
-    dynamic_cols = [c for c in display_df.columns if c not in ordered_cols]
-    final_cols = [c for c in ordered_cols if c in display_df.columns] + dynamic_cols
-
-    display_df = display_df[final_cols]
-
-    rename_map = {
-        "company_name": "Company Name",
-        "sic_codes": "SIC Codes",
-    }
-    return display_df.rename(columns=rename_map)
+        st.info("No companies to show yet.")
+        return
+    display_df = df[["company_name", "sector"]].rename(columns={"company_name": "Company Name", "sector": "Sector"})
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
-def run_pipeline(api_keys: List[str], date_from: str, date_to: str, search_mode: str):
-    seen_companies = set(load_json_file(SEEN_FILE, []))
-    officer_cache = load_json_file(OFFICER_CACHE_FILE, {})
-    officers_cache = load_json_file(OFFICERS_FILE, {})
+def main() -> None:
+    st.title("Companies Incorporated Today")
+    st.caption("Shows companies incorporated today that match your Tech and Holdings SIC code lists.")
 
-    client = RotatingCHClient(api_keys, rotate_every=599)
-    rows = collect_companies(
-        client,
-        date_from,
-        date_to,
-        seen_companies,
-        officer_cache,
-        officers_cache,
-        search_mode
-    )
-
-    save_json_file(SEEN_FILE, sorted(seen_companies))
-    save_json_file(OFFICER_CACHE_FILE, officer_cache)
-    save_json_file(OFFICERS_FILE, officers_cache)
-    write_results_csv(rows, RESULTS_FILE)
-
-    return rows
-
-
-st.set_page_config(page_title="Companies House Live Monitor", layout="wide")
-st.title("Companies House Live Monitor")
-st.caption("Manual refresh dashboard for filtered Companies House results.")
-
-if "last_run_time" not in st.session_state:
-    st.session_state.last_run_time = None
-
-if "last_new_rows" not in st.session_state:
-    st.session_state.last_new_rows = []
-
-if "last_status" not in st.session_state:
-    st.session_state.last_status = "Waiting to run."
-
-with st.sidebar:
-    st.header("Search settings")
-    default_date = datetime.today().strftime("%Y-%m-%d")
-    date_from = st.text_input("Incorporation start date", value=default_date)
-    date_to = st.text_input("Incorporation end date", value=default_date)
-    search_mode = st.radio(
-        "Buzzword search mode",
-        ["Fast", "Full"],
-        help="Fast searches only higher-signal buzzwords. Full searches all configured buzzwords."
-    )
-    run_now = st.button("Refresh results now", type="primary")
-    clear_data = st.button("Clear saved results")
-
-api_keys = get_api_keys_from_sources()
-
-if api_keys:
-    st.success(f"Loaded {len(api_keys)} API key(s) from Streamlit secrets/environment variables.")
-else:
-    st.error(
-        "No API keys found. Add COMPANIES_HOUSE_API_KEYS to Streamlit Community Cloud Secrets "
-        "or to a local .streamlit/secrets.toml file."
-    )
-
-st.info(
-    f"Current mode: {search_mode}. "
-    f"{'Faster, narrower buzzword coverage.' if search_mode == 'Fast' else 'Slower, broader buzzword coverage.'}"
-)
-
-if clear_data:
-    for path in [RESULTS_FILE, SEEN_FILE, OFFICER_CACHE_FILE, OFFICERS_FILE]:
-        if os.path.exists(path):
-            os.remove(path)
-    st.session_state.last_run_time = None
-    st.session_state.last_new_rows = []
-    st.session_state.last_status = "Saved results and caches cleared."
-    st.success("Saved results and caches cleared.")
-    st.rerun()
-
-try:
-    parse_date(date_from)
-    parse_date(date_to)
-except ValueError:
-    st.error("Invalid date format. Please use YYYY-MM-DD.")
-    st.stop()
-
-if run_now:
+    api_keys = get_api_keys()
     if not api_keys:
-        st.session_state.last_status = "Cannot run: no API keys found."
-        st.error("Please add at least one Companies House API key in Streamlit secrets before running the app.")
+        st.error("Add CH_API_KEY_1, CH_API_KEY_2 and/or CH_API_KEY_3 to your Streamlit secrets before running the app.")
+        st.stop()
+
+    run_date = today_uk_str()
+    snapshot_path, seen_path = get_store_paths(run_date)
+
+    st.sidebar.header("Controls")
+    st.sidebar.write(f"Run date: {run_date}")
+    st.sidebar.write(f"API keys loaded: {len(api_keys)}")
+    refresh = st.sidebar.button("Refresh now", type="primary")
+
+    if refresh or not snapshot_path.exists():
+        with st.spinner("Fetching today’s companies from Companies House..."):
+            current_df = fetch_companies_incorporated_today(api_keys, run_date)
+        seen_df = load_csv_or_empty(seen_path)
+        new_df = identify_new_rows(current_df, seen_df)
+        save_state(current_df, snapshot_path, seen_path)
+        st.session_state["latest_df"] = current_df
+        st.session_state["new_df"] = new_df
+        st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
-        try:
-            with st.spinner("Checking Companies House for new matches..."):
-                new_rows = run_pipeline(api_keys, date_from, date_to, search_mode)
-            st.session_state.last_new_rows = new_rows
-            st.session_state.last_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.session_state.last_status = f"Run completed at {st.session_state.last_run_time}"
-            st.success(st.session_state.last_status)
-        except Exception as e:
-            st.session_state.last_status = f"Error during run: {e}"
-            st.error(st.session_state.last_status)
+        current_df = load_csv_or_empty(snapshot_path)
+        st.session_state.setdefault("latest_df", current_df)
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "date_of_creation", "sic_codes", "sector", "kind", "company_status"]))
+        st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
-results_df = load_results_df()
-display_results_df = prepare_display_df(results_df)
-new_results_df = prepare_display_df(pd.DataFrame(st.session_state.last_new_rows)) if st.session_state.last_new_rows else pd.DataFrame()
+    current_df = st.session_state.get("latest_df", pd.DataFrame())
+    new_df = st.session_state.get("new_df", pd.DataFrame())
 
-col1, col2, col3 = st.columns(3)
-col1.metric("Total results", len(results_df))
-col2.metric("New in last run", len(st.session_state.last_new_rows))
-col3.metric("Seen companies", len(load_json_file(SEEN_FILE, [])))
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total pulled today", int(len(current_df)))
+    c2.metric("New on latest refresh", int(len(new_df)))
+    c3.metric("Run date", run_date)
 
-if st.session_state.last_run_time:
-    st.caption(f"Last successful refresh: {st.session_state.last_run_time}")
-else:
-    st.caption("No successful run yet in this session.")
+    st.write(f"Last refresh: {st.session_state.get('last_refresh', 'Unknown')}")
 
-st.caption(st.session_state.last_status)
+    render_table(new_df, "New companies found on the latest refresh")
+    render_table(current_df, "All companies pulled so far today")
 
-st.subheader("New results from last run")
-if not new_results_df.empty:
-    st.dataframe(new_results_df, use_container_width=True)
-else:
-    st.info("No new results found yet.")
+    if not current_df.empty:
+        csv_bytes = current_df[["company_name", "sector"]].rename(columns={"company_name": "Company Name", "sector": "Sector"}).to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download today’s results as CSV",
+            data=csv_bytes,
+            file_name=f"companies_incorporated_{run_date}.csv",
+            mime="text/csv",
+        )
 
-st.subheader("All tracked results")
-if not display_results_df.empty:
-    st.dataframe(display_results_df, use_container_width=True)
-else:
-    st.info("No tracked results yet.")
+    with st.expander("Suggested .streamlit/secrets.toml"):
+        st.code(
+            'CH_API_KEY_1 = "your-first-key"\nCH_API_KEY_2 = "your-second-key"\nCH_API_KEY_3 = "your-third-key"',
+            language="toml",
+        )
+
+    with st.expander("Notes"):
+        st.markdown(
+            """
+- The app uses the Companies House advanced company search endpoint filtered by `incorporated_from`, `incorporated_to`, and your SIC code lists.
+- Holdings takes priority if a company matches both sector lists.
+- The top table shows companies that were not present in the saved daily snapshot before the latest manual refresh.
+- Daily snapshots reset automatically because the file names are date-based.
+            """
+        )
+
+
+if __name__ == "__main__":
+    main()
