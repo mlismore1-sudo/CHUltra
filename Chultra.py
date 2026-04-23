@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -29,12 +29,24 @@ def today_uk_str() -> str:
 
 
 def get_api_keys() -> List[str]:
-    keys = []
+    keys: List[str] = []
+
+    list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
+    if list_style_keys:
+        keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
+
     for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
         value = st.secrets.get(key_name, "")
         if value:
-            keys.append(value)
-    return keys
+            keys.append(str(value).strip())
+
+    deduped_keys = []
+    seen = set()
+    for key in keys:
+        if key and key not in seen:
+            deduped_keys.append(key)
+            seen.add(key)
+    return deduped_keys
 
 
 def auth_header(api_key: str) -> Dict[str, str]:
@@ -55,10 +67,7 @@ def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], t
     last_response = None
     for api_key in api_keys:
         response = requests.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
-        if response.status_code == 429:
-            last_response = response
-            continue
-        if response.status_code == 401:
+        if response.status_code in (401, 429):
             last_response = response
             continue
         response.raise_for_status()
@@ -160,7 +169,7 @@ def main() -> None:
 
     api_keys = get_api_keys()
     if not api_keys:
-        st.error("Add CH_API_KEY_1, CH_API_KEY_2 and/or CH_API_KEY_3 to your Streamlit secrets before running the app.")
+        st.error("Add COMPANIES_HOUSE_API_KEYS or CH_API_KEY_1/2/3 to your Streamlit secrets before running the app.")
         st.stop()
 
     run_date = today_uk_str()
@@ -210,7 +219,7 @@ def main() -> None:
 
     with st.expander("Suggested .streamlit/secrets.toml"):
         st.code(
-            'CH_API_KEY_1 = "your-first-key"\nCH_API_KEY_2 = "your-second-key"\nCH_API_KEY_3 = "your-third-key"',
+            'COMPANIES_HOUSE_API_KEYS = [\n  "your-first-key",\n  "your-second-key",\n  "your-third-key"\n]\n\n# Optional legacy format\n# CH_API_KEY_1 = "your-first-key"\n# CH_API_KEY_2 = "your-second-key"\n# CH_API_KEY_3 = "your-third-key"',
             language="toml",
         )
 
