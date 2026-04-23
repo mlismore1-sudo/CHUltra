@@ -195,7 +195,7 @@ def main() -> None:
         csv_bytes = current_df[["company_name", "sector"]].rename(columns={"company_name": "Company Name", "sector": "Sector"}).to_csv(index=False).encode("utf-8")
         st.download_button(label="Download today’s results as CSV", data=csv_bytes, file_name=f"companies_incorporated_{run_date}.csv", mime="text/csv")
     with st.expander("Suggested .streamlit/secrets.toml"):
-        st.code('COMPANIES_HOUSE_API_KEYS = [
+        secrets_example = """COMPANIES_HOUSE_API_KEYS = [
   "your-first-key",
   "your-second-key",
   "your-third-key"
@@ -204,7 +204,8 @@ def main() -> None:
 # Optional legacy format
 # CH_API_KEY_1 = "your-first-key"
 # CH_API_KEY_2 = "your-second-key"
-# CH_API_KEY_3 = "your-third-key"', language="toml")
+# CH_API_KEY_3 = "your-third-key""" 
+        st.code(secrets_example, language="toml")
     with st.expander("Notes"):
         st.markdown("""
 - The app uses the Companies House advanced company search endpoint filtered by `incorporated_from`, `incorporated_to`, and your SIC code lists.
