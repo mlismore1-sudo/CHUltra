@@ -102,15 +102,13 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
             sector = classify_sector(sic_codes)
             if not sector:
                 continue
-            rows.append(
-                {
-                    "company_number": item.get("company_number", ""),
-                    "company_name": item.get("company_name", ""),
-                    "sector": sector,
-                    "pulled_at": now_uk_str(),
-                    "pull_order": pull_counter,
-                }
-            )
+            rows.append({
+                "company_number": item.get("company_number", ""),
+                "company_name": item.get("company_name", ""),
+                "sector": sector,
+                "time_added_to_table": now_uk_str(),
+                "pull_order": pull_counter,
+            })
             pull_counter += 1
 
         if len(items) < page_size:
@@ -119,7 +117,7 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["company_number", "company_name", "sector", "pulled_at", "pull_order"])
+        return pd.DataFrame(columns=["company_number", "company_name", "sector", "time_added_to_table", "pull_order"])
 
     df = df.sort_values("pull_order", ascending=False, kind="stable").drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
     return df
@@ -133,7 +131,12 @@ def get_store_paths(run_date: str) -> Tuple[Path, Path]:
 
 def load_csv_or_empty(path: Path) -> pd.DataFrame:
     if path.exists():
-        return pd.read_csv(path, dtype=str).fillna("")
+        df = pd.read_csv(path, dtype=str).fillna("")
+        if "time_added_to_table" in df.columns:
+            df["time_added_to_table"] = pd.to_datetime(df["time_added_to_table"], errors="coerce")
+        if "pull_order" in df.columns:
+            df["pull_order"] = pd.to_numeric(df["pull_order"], errors="coerce")
+        return df
     return pd.DataFrame()
 
 
@@ -156,7 +159,7 @@ def render_table(df: pd.DataFrame, title: str) -> None:
     if df.empty:
         st.info("No companies to show yet.")
         return
-    display_df = df.sort_values("pulled_at", ascending=False, kind="stable")[["company_name", "sector", "pulled_at"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "pulled_at": "Time Added To Table"})
+    display_df = df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "time_added_to_table": "Time Added To Table"})
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
@@ -178,8 +181,15 @@ def main() -> None:
     refresh = st.sidebar.button("Refresh now", type="primary")
 
     if refresh or not snapshot_path.exists():
-        with st.spinner("Fetching today’s companies from Companies House..."):
-            current_df = fetch_companies_incorporated_today(api_keys, run_date)
+        fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
+        existing_df = load_csv_or_empty(snapshot_path)
+        if existing_df.empty:
+            current_df = fetched_df.copy()
+        else:
+            existing_numbers = set(existing_df["company_number"].astype(str)) if "company_number" in existing_df.columns else set()
+            new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+            current_df = pd.concat([new_rows, existing_df], ignore_index=True)
+            current_df = current_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
         seen_df = load_csv_or_empty(seen_path)
         new_df = identify_new_rows(current_df, seen_df)
         save_state(current_df, snapshot_path, seen_path)
@@ -189,7 +199,7 @@ def main() -> None:
     else:
         current_df = load_csv_or_empty(snapshot_path)
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "pulled_at", "pull_order"]))
+        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]))
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
     current_df = st.session_state.get("latest_df", pd.DataFrame())
@@ -206,7 +216,7 @@ def main() -> None:
     render_table(current_df, "All companies pulled so far today")
 
     if not current_df.empty:
-        csv_bytes = current_df.sort_values("pulled_at", ascending=False, kind="stable")[["company_name", "sector", "pulled_at"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "pulled_at": "Time Added To Table"}).to_csv(index=False).encode("utf-8")
+        csv_bytes = current_df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "time_added_to_table": "Time Added To Table"}).to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download today’s results as CSV",
             data=csv_bytes,
@@ -233,8 +243,8 @@ def main() -> None:
 - The app uses the Companies House advanced company search endpoint filtered by `incorporated_from`, `incorporated_to`, and your SIC code lists.
 - Holdings takes priority if a company matches both sector lists.
 - `Time Added To Table` shows when the program added the row during that refresh.
+- Existing rows keep their original timestamp after refresh.
 - The top table is sorted newest-first by that timestamp.
-- Daily snapshots reset automatically because the file names are date-based.
             """
         )
 
