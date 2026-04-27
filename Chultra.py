@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -20,6 +20,21 @@ HOLDINGS_SIC_CODES = {
 }
 
 TARGET_SIC_CODES = sorted(TECH_SIC_CODES | HOLDINGS_SIC_CODES)
+
+EXCLUDED_DIRECTOR_COUNTRIES = {
+    "PAKISTAN",
+    "TURKEY",
+    "CHINA",
+    "NIGERIA",
+}
+
+COUNTRY_NORMALISATION = {
+    "TURKIYE": "TURKEY",
+    "PEOPLE'S REPUBLIC OF CHINA": "CHINA",
+    "PRC": "CHINA",
+    "P.R.C.": "CHINA",
+}
+
 DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -37,10 +52,12 @@ def get_api_keys() -> List[str]:
     list_style_keys = st.secrets.get("COMPANIES_HOUSE_API_KEYS", [])
     if list_style_keys:
         keys.extend([str(k).strip() for k in list_style_keys if str(k).strip()])
+
     for key_name in ["CH_API_KEY_1", "CH_API_KEY_2", "CH_API_KEY_3"]:
         value = st.secrets.get(key_name, "")
         if value:
             keys.append(str(value).strip())
+
     deduped_keys = []
     seen = set()
     for key in keys:
@@ -52,7 +69,10 @@ def get_api_keys() -> List[str]:
 
 def auth_header(api_key: str) -> Dict[str, str]:
     token = base64.b64encode(f"{api_key}:".encode()).decode()
-    return {"Authorization": f"Basic {token}", "User-Agent": "streamlit-companies-house-today-app"}
+    return {
+        "Authorization": f"Basic {token}",
+        "User-Agent": "streamlit-companies-house-today-app"
+    }
 
 
 def classify_sector(sic_codes: List[str]) -> str | None:
@@ -64,18 +84,76 @@ def classify_sector(sic_codes: List[str]) -> str | None:
     return None
 
 
-def fetch_with_rotation(url: str, params: Dict[str, str], api_keys: List[str], timeout: int = 30) -> requests.Response:
+def normalise_country(country: str) -> str:
+    value = str(country or "").strip().upper()
+    if not value:
+        return ""
+    return COUNTRY_NORMALISATION.get(value, value)
+
+
+def fetch_with_rotation(
+    url: str,
+    params: Dict[str, str] | None,
+    api_keys: List[str],
+    timeout: int = 30
+) -> requests.Response:
     last_response = None
     for api_key in api_keys:
-        response = requests.get(url, headers=auth_header(api_key), params=params, timeout=timeout)
+        response = requests.get(
+            url,
+            headers=auth_header(api_key),
+            params=params,
+            timeout=timeout,
+        )
         if response.status_code in (401, 429):
             last_response = response
             continue
         response.raise_for_status()
         return response
+
     if last_response is not None:
         last_response.raise_for_status()
     raise RuntimeError("No valid Companies House API keys were available.")
+
+
+def get_active_director_countries(company_number: str, api_keys: List[str]) -> List[str]:
+    url = f"https://api.company-information.service.gov.uk/company/{company_number}/officers"
+    response = fetch_with_rotation(url, None, api_keys)
+    payload = response.json()
+    items = payload.get("items", []) or []
+
+    countries: List[str] = []
+    for officer in items:
+        officer_role = str(officer.get("officer_role", "")).strip().lower()
+        resigned_on = officer.get("resigned_on")
+        if officer_role != "director":
+            continue
+        if resigned_on:
+            continue
+
+        country = normalise_country(officer.get("country_of_residence", ""))
+        if country:
+            countries.append(country)
+
+    return countries
+
+
+def is_excluded_by_director_country(
+    company_number: str,
+    api_keys: List[str],
+    officer_country_cache: Dict[str, bool]
+) -> bool:
+    if company_number in officer_country_cache:
+        return officer_country_cache[company_number]
+
+    try:
+        countries = get_active_director_countries(company_number, api_keys)
+        is_excluded = any(country in EXCLUDED_DIRECTOR_COUNTRIES for country in countries)
+    except requests.RequestException:
+        is_excluded = False
+
+    officer_country_cache[company_number] = is_excluded
+    return is_excluded
 
 
 def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd.DataFrame:
@@ -84,6 +162,7 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
     page_size = 5000
     rows = []
     pull_counter = 0
+    officer_country_cache: Dict[str, bool] = {}
 
     while True:
         params = {
@@ -98,12 +177,20 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
         items = payload.get("items", []) or []
 
         for item in items:
+            company_number = str(item.get("company_number", "")).strip()
+            if not company_number:
+                continue
+
             sic_codes = [str(code) for code in item.get("sic_codes", []) if code]
             sector = classify_sector(sic_codes)
             if not sector:
                 continue
+
+            if is_excluded_by_director_country(company_number, api_keys, officer_country_cache):
+                continue
+
             rows.append({
-                "company_number": item.get("company_number", ""),
+                "company_number": company_number,
                 "company_name": item.get("company_name", ""),
                 "sector": sector,
                 "time_added_to_table": now_uk_str(),
@@ -117,9 +204,19 @@ def fetch_companies_incorporated_today(api_keys: List[str], run_date: str) -> pd
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["company_number", "company_name", "sector", "time_added_to_table", "pull_order"])
+        return pd.DataFrame(columns=[
+            "company_number",
+            "company_name",
+            "sector",
+            "time_added_to_table",
+            "pull_order"
+        ])
 
-    df = df.sort_values("pull_order", ascending=False, kind="stable").drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+    df = (
+        df.sort_values("pull_order", ascending=False, kind="stable")
+        .drop_duplicates(subset=["company_number"], keep="first")
+        .reset_index(drop=True)
+    )
     return df
 
 
@@ -159,13 +256,27 @@ def render_table(df: pd.DataFrame, title: str) -> None:
     if df.empty:
         st.info("No companies to show yet.")
         return
-    display_df = df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "time_added_to_table": "Time Added To Table"})
+
+    display_df = (
+        df.sort_values("time_added_to_table", ascending=False, kind="stable")[
+            ["company_name", "sector", "time_added_to_table"]
+        ]
+        .rename(columns={
+            "company_name": "Company Name",
+            "sector": "Sector",
+            "time_added_to_table": "Time Added To Table"
+        })
+    )
     st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 
 def main() -> None:
     st.title("Companies Incorporated Today")
-    st.caption("Shows companies incorporated today that match your Tech and Holdings SIC code lists, with the newest table additions at the top.")
+    st.caption(
+        "Shows companies incorporated today that match your Tech and Holdings SIC code lists, "
+        "excluding companies with active directors whose country of residence is Pakistan, "
+        "Turkey, China, or Nigeria."
+    )
 
     api_keys = get_api_keys()
     if not api_keys:
@@ -183,23 +294,40 @@ def main() -> None:
     if refresh or not snapshot_path.exists():
         fetched_df = fetch_companies_incorporated_today(api_keys, run_date)
         existing_df = load_csv_or_empty(snapshot_path)
+
         if existing_df.empty:
             current_df = fetched_df.copy()
         else:
-            existing_numbers = set(existing_df["company_number"].astype(str)) if "company_number" in existing_df.columns else set()
-            new_rows = fetched_df[~fetched_df["company_number"].astype(str).isin(existing_numbers)].copy()
+            existing_numbers = (
+                set(existing_df["company_number"].astype(str))
+                if "company_number" in existing_df.columns
+                else set()
+            )
+            new_rows = fetched_df[
+                ~fetched_df["company_number"].astype(str).isin(existing_numbers)
+            ].copy()
             current_df = pd.concat([new_rows, existing_df], ignore_index=True)
-            current_df = current_df.drop_duplicates(subset=["company_number"], keep="first").reset_index(drop=True)
+            current_df = (
+                current_df.drop_duplicates(subset=["company_number"], keep="first")
+                .reset_index(drop=True)
+            )
+
         seen_df = load_csv_or_empty(seen_path)
         new_df = identify_new_rows(current_df, seen_df)
         save_state(current_df, snapshot_path, seen_path)
+
         st.session_state["latest_df"] = current_df
         st.session_state["new_df"] = new_df
         st.session_state["last_refresh"] = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     else:
         current_df = load_csv_or_empty(snapshot_path)
         st.session_state.setdefault("latest_df", current_df)
-        st.session_state.setdefault("new_df", pd.DataFrame(columns=current_df.columns if not current_df.empty else ["company_number", "company_name", "sector", "time_added_to_table", "pull_order"]))
+        st.session_state.setdefault(
+            "new_df",
+            pd.DataFrame(columns=current_df.columns if not current_df.empty else [
+                "company_number", "company_name", "sector", "time_added_to_table", "pull_order"
+            ])
+        )
         st.session_state.setdefault("last_refresh", "Not refreshed in this session")
 
     current_df = st.session_state.get("latest_df", pd.DataFrame())
@@ -216,7 +344,19 @@ def main() -> None:
     render_table(current_df, "All companies pulled so far today")
 
     if not current_df.empty:
-        csv_bytes = current_df.sort_values("time_added_to_table", ascending=False, kind="stable")[["company_name", "sector", "time_added_to_table"]].rename(columns={"company_name": "Company Name", "sector": "Sector", "time_added_to_table": "Time Added To Table"}).to_csv(index=False).encode("utf-8")
+        csv_bytes = (
+            current_df.sort_values("time_added_to_table", ascending=False, kind="stable")[
+                ["company_name", "sector", "time_added_to_table"]
+            ]
+            .rename(columns={
+                "company_name": "Company Name",
+                "sector": "Sector",
+                "time_added_to_table": "Time Added To Table"
+            })
+            .to_csv(index=False)
+            .encode("utf-8")
+        )
+
         st.download_button(
             label="Download today’s results as CSV",
             data=csv_bytes,
@@ -234,17 +374,20 @@ def main() -> None:
 # Optional legacy format
 # CH_API_KEY_1 = "your-first-key"
 # CH_API_KEY_2 = "your-second-key"
-# CH_API_KEY_3 = "your-third-key""" 
+# CH_API_KEY_3 = "your-third-key"
+"""
         st.code(secrets_example, language="toml")
 
     with st.expander("Notes"):
         st.markdown(
             """
 - The app uses the Companies House advanced company search endpoint filtered by `incorporated_from`, `incorporated_to`, and your SIC code lists.
+- It then checks each company’s officers and excludes any company with an active director whose `country_of_residence` is Pakistan, Turkey, China, or Nigeria.
 - Holdings takes priority if a company matches both sector lists.
 - `Time Added To Table` shows when the program added the row during that refresh.
 - Existing rows keep their original timestamp after refresh.
 - The top table is sorted newest-first by that timestamp.
+- If an officer lookup fails for a company, the app currently keeps that company rather than excluding it.
             """
         )
 
